@@ -9,6 +9,7 @@ from datetime import datetime
 
 from hindsight_client import Hindsight
 from hindsight_client_api.exceptions import ApiException
+from aiohttp import ClientResponseError
 
 from src.config import Settings, get_settings
 from src.models import MemoryItem
@@ -29,6 +30,7 @@ class HindsightMemoryManager:
 
     def __init__(self, config: Optional[Settings] = None):
         self.config = config or get_settings()
+        self._verified_banks: set[str] = set()
         self._client: Optional[Hindsight] = None
         self._initialize_client()
 
@@ -36,6 +38,7 @@ class HindsightMemoryManager:
         """Initialize the Hindsight client using current configuration."""
         base_url = self.config.hindsight_api_url or "https://api.hindsight.vectorize.io"
         api_key = self.config.hindsight_api_key or None
+        self._verified_banks = set()
 
         try:
             self._client = Hindsight(
@@ -81,12 +84,18 @@ class HindsightMemoryManager:
                 retain_mission=mission_text,
                 reflect_mission=mission_text,
             )
+            self._verified_banks.add(target_bank)
             return True, f"Memory bank '{target_bank}' is ready and configured."
-        except ApiException as e:
-            logger.error(f"Hindsight ApiException during create_bank: {e.status} {e.body}")
-            if e.status == 401:
+        except (ApiException, ClientResponseError) as e:
+            status = getattr(e, "status", None)
+            body = getattr(e, "body", None) or getattr(e, "message", None) or str(e)
+            if status == 409:
+                self._verified_banks.add(target_bank)
+                return True, f"Memory bank '{target_bank}' is ready and verified."
+            logger.error(f"Hindsight API Error during create_bank ({status}): {body}")
+            if status == 401:
                 return False, "Authentication failed: Invalid Hindsight API Key."
-            return False, f"Hindsight API Error ({e.status}): {e.reason or e.body}"
+            return False, f"Hindsight API Error ({status}): {body}"
         except Exception as e:
             logger.exception("Unexpected error while ensuring Hindsight bank exists")
             return False, f"Connection error: {str(e)}"
@@ -101,6 +110,7 @@ class HindsightMemoryManager:
     ) -> Tuple[List[MemoryItem], Optional[str]]:
         """
         Recall relevant team knowledge from Hindsight using semantic search.
+        Guarantees that the target bank exists before issuing the recall request.
 
         Args:
             query: Semantic search query describing code constructs, language, or domain
@@ -116,6 +126,14 @@ class HindsightMemoryManager:
             return [], "HINDSIGHT_API_KEY not configured. Memory recall is disabled."
 
         target_bank = (bank_id or self.config.hindsight_bank_id).strip()
+        if not target_bank:
+            return [], "HINDSIGHT_BANK_ID cannot be empty."
+
+        # Proactively ensure the bank exists in Hindsight before issuing recall
+        if target_bank not in self._verified_banks:
+            ok, bank_msg = self.ensure_bank_exists(target_bank)
+            if not ok:
+                logger.warning(f"Could not proactively ensure bank '{target_bank}' before recall: {bank_msg}")
 
         try:
             # Official Hindsight recall method
@@ -154,13 +172,51 @@ class HindsightMemoryManager:
 
             return memories, None
 
-        except ApiException as e:
-            logger.error(f"Hindsight ApiException during recall: {e.status} {e.body}")
-            if e.status == 401:
+        except (ApiException, ClientResponseError) as e:
+            status = getattr(e, "status", None)
+            body = getattr(e, "body", None) or getattr(e, "message", None) or str(e)
+            logger.error(f"Hindsight API error during recall ({status}): {body}")
+            if status == 401:
                 return [], "Hindsight Authentication Error: Invalid API Key."
-            if e.status == 404:
-                return [], f"Bank '{target_bank}' not found. Please click 'Seed Standard Team Rules' to initialize."
-            return [], f"Hindsight API Error ({e.status}): {e.reason or e.body}"
+            if status == 404:
+                # Bank was missing or not yet indexed; auto-heal by creating and retrying
+                logger.info(f"Bank '{target_bank}' not found (404); attempting auto-creation and retry...")
+                created_ok, _ = self.ensure_bank_exists(target_bank)
+                if created_ok:
+                    try:
+                        retry_resp = self._client.recall(
+                            bank_id=target_bank,
+                            query=query,
+                            tags=tags,
+                            budget=budget,
+                            max_tokens=max_tokens,
+                        )
+                        retry_memories: List[MemoryItem] = []
+                        if retry_resp and hasattr(retry_resp, "results") and retry_resp.results:
+                            for item in retry_resp.results:
+                                score = None
+                                if hasattr(item, "scores") and item.scores:
+                                    score = getattr(item.scores, "final", None) or getattr(
+                                        item.scores, "semantic", None
+                                    )
+                                metadata = getattr(item, "metadata", {}) or {}
+                                category = metadata.get("category", "team_standard") if isinstance(metadata, dict) else "team_standard"
+                                retry_memories.append(
+                                    MemoryItem(
+                                        id=getattr(item, "id", "") or "",
+                                        text=getattr(item, "text", ""),
+                                        category=category,
+                                        tags=getattr(item, "tags", []) or [],
+                                        context=getattr(item, "context", None),
+                                        metadata=metadata if isinstance(metadata, dict) else {},
+                                        score=float(score) if score is not None else None,
+                                    )
+                                )
+                        return retry_memories, None
+                    except Exception as retry_err:
+                        logger.error(f"Retry recall after bank creation failed: {retry_err}")
+                return [], f"Bank '{target_bank}' was created but currently contains no memories. Click 'Seed Standard Team Rules' to populate."
+            return [], f"Hindsight API Error ({status}): {body}"
         except Exception as e:
             logger.exception("Error recalling memories from Hindsight")
             return [], f"Hindsight connection error: {str(e)}"
@@ -194,9 +250,18 @@ class HindsightMemoryManager:
             return False, "HINDSIGHT_API_KEY not configured. Cannot retain knowledge."
 
         target_bank = (bank_id or self.config.hindsight_bank_id).strip()
+        if not target_bank:
+            return False, "HINDSIGHT_BANK_ID cannot be empty."
+
         cleaned_content = content.strip()
         if not cleaned_content:
             return False, "Cannot retain empty memory content."
+
+        # Proactively ensure the bank exists before attempting retain
+        if target_bank not in self._verified_banks:
+            ok, bank_msg = self.ensure_bank_exists(target_bank)
+            if not ok:
+                logger.warning(f"Could not proactively ensure bank '{target_bank}' before retain: {bank_msg}")
 
         # Consolidate tags
         effective_tags = list(set([language.lower(), category.lower(), source.lower()] + (tags or [])))
@@ -229,11 +294,30 @@ class HindsightMemoryManager:
                 return True, f"Retained lesson in '{target_bank}': {cleaned_content[:80]}..."
             return False, "Hindsight returned unconfirmed retain status."
 
-        except ApiException as e:
-            logger.error(f"Hindsight ApiException during retain: {e.status} {e.body}")
-            if e.status == 401:
+        except (ApiException, ClientResponseError) as e:
+            status = getattr(e, "status", None)
+            body = getattr(e, "body", None) or getattr(e, "message", None) or str(e)
+            logger.error(f"Hindsight API error during retain ({status}): {body}")
+            if status == 401:
                 return False, "Authentication failed: Invalid Hindsight API Key."
-            return False, f"Hindsight API Error ({e.status}): {e.reason or e.body}"
+            if status == 404:
+                # Bank was missing; auto-heal by creating and retrying retain
+                logger.info(f"Bank '{target_bank}' not found (404); attempting auto-creation and retry retain...")
+                created_ok, _ = self.ensure_bank_exists(target_bank)
+                if created_ok:
+                    try:
+                        retry_resp = self._client.retain(
+                            bank_id=target_bank,
+                            content=cleaned_content,
+                            context=context_description,
+                            metadata=effective_meta,
+                            tags=effective_tags,
+                        )
+                        if retry_resp and getattr(retry_resp, "success", True):
+                            return True, f"Retained lesson in '{target_bank}': {cleaned_content[:80]}..."
+                    except Exception as retry_err:
+                        logger.error(f"Retry retain after bank creation failed: {retry_err}")
+            return False, f"Hindsight API Error ({status}): {body}"
         except Exception as e:
             logger.exception("Error retaining memory in Hindsight")
             return False, f"Hindsight retention error: {str(e)}"
@@ -318,11 +402,19 @@ class HindsightMemoryManager:
     def test_connection(self, bank_id: Optional[str] = None) -> Tuple[bool, str]:
         """
         Verify live connection and authentication with the Hindsight service.
+        Guarantees that the bank exists before checking recall.
         """
         if not self.config.hindsight_api_key:
             return False, "Missing HINDSIGHT_API_KEY. Please provide your key in .env or settings."
 
         target_bank = (bank_id or self.config.hindsight_bank_id).strip()
+        if not target_bank:
+            return False, "Missing HINDSIGHT_BANK_ID."
+
+        # Guarantee bank exists first
+        ok, msg = self.ensure_bank_exists(target_bank)
+        if not ok:
+            return False, f"Failed to connect or configure bank '{target_bank}': {msg}"
 
         try:
             # Perform a test recall query to test full read capabilities
@@ -333,12 +425,12 @@ class HindsightMemoryManager:
                 max_tokens=256,
             )
             count = len(response.results) if response and hasattr(response, "results") and response.results else 0
-            return True, f"Successfully connected to Hindsight at {self.config.hindsight_api_url}. Bank '{target_bank}' reachable ({count} memories matched)."
-        except ApiException as e:
-            if e.status == 401:
-                return False, f"Hindsight Authentication Failed (401): {e.body or 'Invalid API Key'}"
-            if e.status == 404:
-                return True, f"Connected to Hindsight server, but bank '{target_bank}' does not exist yet. Click 'Seed Standard Team Rules' to create it."
-            return False, f"Hindsight API Error ({e.status}): {e.reason or e.body}"
+            return True, f"Successfully connected to Hindsight at {self.config.hindsight_api_url}. Bank '{target_bank}' ready ({count} memories matched)."
+        except (ApiException, ClientResponseError) as e:
+            status = getattr(e, "status", None)
+            body = getattr(e, "body", None) or getattr(e, "message", None) or str(e)
+            if status == 401:
+                return False, f"Hindsight Authentication Failed (401): {body or 'Invalid API Key'}"
+            return False, f"Hindsight API Error ({status}): {body}"
         except Exception as e:
             return False, f"Hindsight connection failed: {str(e)}"
