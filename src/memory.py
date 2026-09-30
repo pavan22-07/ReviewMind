@@ -45,7 +45,7 @@ class HindsightMemoryManager:
                 base_url=base_url,
                 api_key=api_key,
                 user_agent="ReviewMind-Agent/1.0",
-                timeout=15.0,
+                timeout=60.0,
             )
         except Exception as e:
             logger.error(f"Failed to instantiate Hindsight client: {e}")
@@ -333,9 +333,10 @@ class HindsightMemoryManager:
         target_bank = (bank_id or self.config.hindsight_bank_id).strip()
 
         # First ensure bank exists
-        ok, msg = self.ensure_bank_exists(target_bank)
-        if not ok:
-            return 0, [f"Failed to initialize bank: {msg}"]
+        if target_bank not in self._verified_banks:
+            ok, msg = self.ensure_bank_exists(target_bank)
+            if not ok:
+                return 0, [f"Failed to initialize bank: {msg}"]
 
         foundational_rules = [
             {
